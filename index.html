@@ -60,6 +60,7 @@
   <div class="chips" id="chips"></div>
   <div class="row">
     <label class="btn">📷 Photo<input type="file" id="photoIn" accept="image/*" multiple hidden></label>
+    <label class="btn">🎥 Vidéo<input type="file" id="videoIn" accept="video/*" capture="environment" hidden></label>
     <button id="recBtn">🎙️ Mémo vocal</button>
     <label class="btn">📎 Fichier<input type="file" id="fileIn" multiple hidden></label>
   </div>
@@ -76,7 +77,9 @@
 window.JOURNAL_CONFIG = {
   CLIENT_ID: "288854496720-pb22j8u2dkr3n2f8rmo4fh3uhnd35qlq.apps.googleusercontent.com",
   ROOT_FOLDER: "Journal",   // dossier racine créé dans ton Google Drive
-  MAX_PHOTO_PX: 2560        // réduit les grosses photos (0 = garder l'original)
+  MAX_PHOTO_PX: 2560,       // réduit les grosses photos (0 = garder l'original)
+  MAX_VIDEO_MB: 300,        // taille max d'une vidéo (la mémoire de l'iPhone est limitée)
+  INDEX_NAME: "Journal - Index"  // feuille Google Sheets listant toutes les entrées
 };
 </script>
 <script>
@@ -185,15 +188,92 @@ async function ensureFolder(name, parentId) {
   localStorage.setItem(cacheKey, id);
   return id;
 }
-async function uploadFile(name, mime, blob, parentId) {
+function multipartBody(meta, mime, blob) {
   const b = "jrnl" + Math.random().toString(36).slice(2);
   const body = new Blob([
-    `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [parentId] })}\r\n`,
+    `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n`,
     `--${b}\r\nContent-Type: ${mime || "application/octet-stream"}\r\n\r\n`, blob, `\r\n--${b}--`
   ]);
-  return gfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
-    method: "POST", headers: { "Content-Type": "multipart/related; boundary=" + b }, body });
+  return { body, type: "multipart/related; boundary=" + b };
 }
+async function uploadFile(name, mime, blob, parentId) {
+  const F = "id,webViewLink";
+  if (blob.size > 4 * 1048576) {   // gros fichier (vidéo…) : envoi "resumable"
+    const t = getToken(); if (!t) throw new Error("AUTH");
+    const init = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=" + F, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + t, "Content-Type": "application/json; charset=UTF-8",
+                 "X-Upload-Content-Type": mime || "application/octet-stream", "X-Upload-Content-Length": String(blob.size) },
+      body: JSON.stringify({ name, parents: [parentId] }) });
+    if (init.status === 401) { localStorage.removeItem("g_token"); refreshAuthUI(); throw new Error("AUTH"); }
+    if (!init.ok) throw new Error("Drive " + init.status + " " + (await init.text()).slice(0, 200));
+    const loc = init.headers.get("Location");
+    if (!loc) throw new Error("Drive : adresse d'envoi manquante");
+    const up = await fetch(loc, { method: "PUT", headers: { "Content-Type": mime || "application/octet-stream" }, body: blob });
+    if (!up.ok) throw new Error("Drive " + up.status + " " + (await up.text()).slice(0, 200));
+    return up.json();
+  }
+  const mp = multipartBody({ name, parents: [parentId] }, mime, blob);
+  return gfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=" + F, {
+    method: "POST", headers: { "Content-Type": mp.type }, body: mp.body });
+}
+
+/* ---------- Index « Journal - Index » (Google Sheets, créé via Drive) ---------- */
+const SHEET_MIME = "application/vnd.google-apps.spreadsheet";
+const INDEX_HEAD = ["Date", "Heure", "Titre", "Type", "Nom du fichier", "Dossier", "Lien"];
+const csvEsc = v => { v = String(v == null ? "" : v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+function csvParse(txt) {
+  const rows = []; let row = [], f = "", q = false;
+  for (let i = 0; i < txt.length; i++) {
+    const c = txt[i];
+    if (q) { if (c === '"') { if (txt[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+    else if (c === '"') q = true;
+    else if (c === ",") { row.push(f); f = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && txt[i + 1] === "\n") i++; row.push(f); f = ""; rows.push(row); row = []; }
+    else f += c;
+  }
+  if (f !== "" || row.length) { row.push(f); rows.push(row); }
+  return rows.filter(r => r.length > 1 || (r[0] || "") !== "");
+}
+async function gtext(url) {
+  const t = getToken(); if (!t) throw new Error("AUTH");
+  const r = await fetch(url, { headers: { Authorization: "Bearer " + t } });
+  if (r.status === 401) { localStorage.removeItem("g_token"); refreshAuthUI(); throw new Error("AUTH"); }
+  if (!r.ok) throw new Error("Drive " + r.status + " " + (await r.text()).slice(0, 200));
+  return r.text();
+}
+async function updateIndex(rootId, newRows, retry = true) {
+  try {
+    let id = localStorage.getItem("indexId:" + rootId);
+    if (!id) {
+      const q = `name='${CFG.INDEX_NAME}' and '${rootId}' in parents and trashed=false and mimeType='${SHEET_MIME}'`;
+      const found = await gfetch("https://www.googleapis.com/drive/v3/files?fields=files(id)&q=" + encodeURIComponent(q));
+      id = found.files[0] && found.files[0].id;
+    }
+    let rows = [INDEX_HEAD];
+    if (id) {
+      const old = csvParse(await gtext(`https://www.googleapis.com/drive/v3/files/${id}/export?mimeType=text/csv`));
+      if (old.length) rows = old;
+    }
+    const key = r => r[0] + "|" + r[1] + "|" + r[4];
+    const have = new Set(rows.slice(1).map(key));
+    for (const r of newRows) if (!have.has(key(r))) { rows.push(r); have.add(key(r)); }
+    const csv = rows.map(r => r.map(csvEsc).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    if (id) {
+      const mp = multipartBody({}, "text/csv", blob);
+      await gfetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=multipart&fields=id`, { method: "PATCH", headers: { "Content-Type": mp.type }, body: mp.body });
+    } else {
+      const mp = multipartBody({ name: CFG.INDEX_NAME, parents: [rootId], mimeType: SHEET_MIME }, "text/csv", blob);
+      id = (await gfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", { method: "POST", headers: { "Content-Type": mp.type }, body: mp.body })).id;
+    }
+    localStorage.setItem("indexId:" + rootId, id);
+  } catch (err) {
+    if (retry && /^Drive 404/.test(err.message)) { localStorage.removeItem("indexId:" + rootId); return updateIndex(rootId, newRows, false); }
+    throw err;
+  }
+}
+const typeLabel = m => m.type.startsWith("image/") ? "Photo" : m.type.startsWith("video/") ? "Vidéo" : (m.type.startsWith("audio/") || /^memo_/.test(m.name)) ? "Mémo vocal" : "Fichier";
 
 let syncing = false;
 async function syncAll() {
@@ -210,14 +290,22 @@ async function syncAll() {
       const prefix = timeStr(d);
       for (const m of e.media) {
         if (m.uploaded) continue;
-        await uploadFile(`${prefix}_${m.name}`, m.type, mediaBlob(m), day);
-        m.uploaded = true; await dbPut(e);   // reprise possible si coupure
+        msg(`Envoi de « ${m.name} » (${Math.max(1, Math.round(mediaBlob(m).size / 1048576))} Mo)…`);
+        const up = await uploadFile(`${prefix}_${m.name}`, m.type, mediaBlob(m), day);
+        m.link = up.webViewLink || ""; m.uploaded = true; await dbPut(e);   // reprise possible si coupure
       }
       if (!e.textUploaded) {
         const lines = [`# ${e.title || "Entrée du " + dayStr(d)}`, `*${dayStr(d)} ${d.toLocaleTimeString("fr-CA")}*`, "", e.text || ""];
         if (e.media.length) lines.push("", "## Pièces jointes", ...e.media.map(m => `- ${prefix}_${m.name}`));
-        await uploadFile(`${prefix}_${safe(e.title || "entree")}.md`, "text/markdown", new Blob([lines.join("\n")], { type: "text/markdown" }), day);
-        e.textUploaded = true;
+        const up = await uploadFile(`${prefix}_${safe(e.title || "entree")}.md`, "text/markdown", new Blob([lines.join("\n")], { type: "text/markdown" }), day);
+        e.textLink = up.webViewLink || ""; e.textUploaded = true; await dbPut(e);
+      }
+      if (!e.indexed) {
+        const dt = dayStr(d), hr = d.toLocaleTimeString("fr-CA", { hour: "2-digit", minute: "2-digit", second: "2-digit" }), ttl = e.title || "(sans titre)";
+        const rows = e.media.map(m => [dt, hr, ttl, typeLabel(m), `${prefix}_${m.name}`, `${CFG.ROOT_FOLDER}/${dt}`, m.link || ""]);
+        rows.push([dt, hr, ttl, "Texte", `${prefix}_${safe(e.title || "entree")}.md`, `${CFG.ROOT_FOLDER}/${dt}`, e.textLink || ""]);
+        await updateIndex(root, rows);
+        e.indexed = true; await dbPut(e);
       }
       e.synced = true; await dbPut(e);
     }
@@ -235,6 +323,7 @@ function renderChips() {
   media.forEach((m, i) => {
     const c = document.createElement("div"); c.className = "chip";
     if (m.type.startsWith("image/")) c.innerHTML = `<img src="${m.url}">`;
+    else if (m.type.startsWith("video/")) c.innerHTML = `<video src="${m.url}#t=0.1" preload="metadata" muted playsinline style="width:96px;height:72px;object-fit:cover;border-radius:8px;display:block"></video>`;
     else if (m.type.startsWith("audio/")) c.innerHTML = `<audio controls src="${m.url}"></audio>`;
     else { const s = document.createElement("span"); s.className = "l"; s.textContent = "📎 " + m.name; c.appendChild(s); }
     const x = document.createElement("button"); x.textContent = "✕";
@@ -265,6 +354,14 @@ async function addFiles(files, isPhoto) {
   renderChips();
 }
 $("photoIn").onchange = async e => { const fs = [...e.target.files]; e.target.value = ""; await addFiles(fs, true); };
+$("videoIn").onchange = async e => {
+  const fs = [...e.target.files]; e.target.value = "";
+  const ok = fs.filter(f => {
+    if (CFG.MAX_VIDEO_MB && f.size > CFG.MAX_VIDEO_MB * 1048576) { msg(`Vidéo trop lourde (${Math.round(f.size/1048576)} Mo, max ${CFG.MAX_VIDEO_MB} Mo).`); return false; }
+    return true;
+  });
+  await addFiles(ok, false);
+};
 $("fileIn").onchange = async e => { const fs = [...e.target.files]; e.target.value = ""; await addFiles(fs, false); };
 
 /* ---------- Mémo vocal ---------- */
