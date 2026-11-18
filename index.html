@@ -72,7 +72,7 @@
 <div class="row" style="margin:0 12px"><button id="syncBtn">🔄 Synchroniser maintenant</button></div>
 
 <script>
-// ====== CONFIGURATION — colle ici ton ID client OAuth Google (voir LISEZMOI.md) ======
+// ====== CONFIGURATION ======
 window.JOURNAL_CONFIG = {
   CLIENT_ID: "288854496720-pb22j8u2dkr3n2f8rmo4fh3uhnd35qlq.apps.googleusercontent.com",
   ROOT_FOLDER: "Journal",   // dossier racine créé dans ton Google Drive
@@ -91,7 +91,7 @@ function msg(t) { $("msg").textContent = t || ""; }
 
 $("today").textContent = new Date().toLocaleDateString("fr-CA", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
 
-/* ---------- IndexedDB ---------- */
+/* ---------- IndexedDB (avec gestion d'erreurs) ---------- */
 let db;
 function openDB() {
   return new Promise((res, rej) => {
@@ -101,10 +101,34 @@ function openDB() {
     r.onerror = () => rej(r.error);
   });
 }
-const tx = (mode) => db.transaction("entries", mode).objectStore("entries");
-const dbAll = () => new Promise(res => { const q = tx("readonly").getAll(); q.onsuccess = () => res(q.result); });
-const dbPut = e => new Promise(res => { const q = tx("readwrite").put(e); q.onsuccess = res; });
-const dbDel = id => new Promise(res => { const q = tx("readwrite").delete(id); q.onsuccess = res; });
+// Chaque opération attend la fin de la transaction et remonte toute erreur.
+function run(mode, fn) {
+  return new Promise((res, rej) => {
+    let out, t;
+    try {
+      t = db.transaction("entries", mode);
+      const req = fn(t.objectStore("entries"));
+      if (req) req.onsuccess = () => { out = req.result; };
+    } catch (err) { rej(err); return; }
+    t.oncomplete = () => res(out);
+    t.onerror = () => rej(t.error || new Error("Erreur IndexedDB"));
+    t.onabort = () => rej(t.error || new Error("Transaction IndexedDB annulée"));
+  });
+}
+const dbAll = () => run("readonly", s => s.getAll());
+const dbPut = e => run("readwrite", s => s.put(e));
+const dbDel = id => run("readwrite", s => s.delete(id));
+
+// Les Blob/File dans IndexedDB échouent sur Safari iOS : on stocke des ArrayBuffer.
+async function toBuf(blob) {
+  if (blob.arrayBuffer) return blob.arrayBuffer();
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result); fr.onerror = () => rej(fr.error);
+    fr.readAsArrayBuffer(blob);
+  });
+}
+const mediaBlob = m => m.data ? new Blob([m.data], { type: m.type }) : m.blob; // m.blob = anciennes entrées
 
 /* ---------- Auth Google (flux implicite par redirection) ---------- */
 function redirectUri() { return location.origin + location.pathname; }
@@ -186,7 +210,7 @@ async function syncAll() {
       const prefix = timeStr(d);
       for (const m of e.media) {
         if (m.uploaded) continue;
-        await uploadFile(`${prefix}_${m.name}`, m.type, m.blob, day);
+        await uploadFile(`${prefix}_${m.name}`, m.type, mediaBlob(m), day);
         m.uploaded = true; await dbPut(e);   // reprise possible si coupure
       }
       if (!e.textUploaded) {
@@ -212,7 +236,7 @@ function renderChips() {
     const c = document.createElement("div"); c.className = "chip";
     if (m.type.startsWith("image/")) c.innerHTML = `<img src="${m.url}">`;
     else if (m.type.startsWith("audio/")) c.innerHTML = `<audio controls src="${m.url}"></audio>`;
-    else c.innerHTML = `<span class="l">📎 ${m.name}</span>`;
+    else { const s = document.createElement("span"); s.className = "l"; s.textContent = "📎 " + m.name; c.appendChild(s); }
     const x = document.createElement("button"); x.textContent = "✕";
     x.onclick = () => { URL.revokeObjectURL(m.url); media.splice(i, 1); renderChips(); };
     c.appendChild(x); $("chips").appendChild(c);
@@ -226,20 +250,22 @@ async function shrink(file) {
     if (k === 1 && file.type === "image/jpeg") return file;
     const c = document.createElement("canvas"); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
     c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-    return await new Promise(r => c.toBlob(r, "image/jpeg", 0.9));
+    return await new Promise(r => c.toBlob(r, "image/jpeg", 0.9)) || file;
   } catch { return file; }
 }
 async function addFiles(files, isPhoto) {
   for (const f of files) {
-    const blob = isPhoto ? await shrink(f) : f;
-    let name = safe(f.name || "fichier");
-    if (isPhoto && blob !== f) name = name.replace(/\.\w+$/, "") + ".jpg";
-    media.push({ name, type: blob.type || f.type || "application/octet-stream", blob, url: URL.createObjectURL(blob) });
+    try {
+      const blob = isPhoto ? await shrink(f) : f;
+      let name = safe(f.name || "fichier");
+      if (isPhoto && blob !== f) name = name.replace(/\.\w+$/, "") + ".jpg";
+      media.push({ name, type: blob.type || f.type || "application/octet-stream", blob, url: URL.createObjectURL(blob) });
+    } catch (err) { msg("Impossible d'ajouter « " + (f.name || "fichier") + " » : " + err.message); }
   }
   renderChips();
 }
-$("photoIn").onchange = async e => { await addFiles([...e.target.files], true); e.target.value = ""; };
-$("fileIn").onchange = async e => { await addFiles([...e.target.files], false); e.target.value = ""; };
+$("photoIn").onchange = async e => { const fs = [...e.target.files]; e.target.value = ""; await addFiles(fs, true); };
+$("fileIn").onchange = async e => { const fs = [...e.target.files]; e.target.value = ""; await addFiles(fs, false); };
 
 /* ---------- Mémo vocal ---------- */
 let rec = null, stream = null, chunks = [], t0 = 0, tick = null;
@@ -253,7 +279,7 @@ $("recBtn").onclick = async () => {
     rec.ondataavailable = e => e.data.size && chunks.push(e.data);
     rec.onstop = () => {
       clearInterval(tick); stream.getTracks().forEach(t => t.stop());
-      const type = rec.mimeType || "audio/mp4";
+      const type = (rec.mimeType || "audio/mp4").split(";")[0];
       const blob = new Blob(chunks, { type });
       const ext = type.includes("mp4") ? "m4a" : "webm";
       media.push({ name: `memo_${timeStr(new Date())}.${ext}`, type, blob, url: URL.createObjectURL(blob) });
@@ -269,15 +295,30 @@ $("recBtn").onclick = async () => {
 };
 
 /* ---------- Enregistrer ---------- */
+let saving = false;
 $("saveBtn").onclick = async () => {
+  if (saving) return;
   const title = $("title").value.trim(), text = $("text").value.trim();
   if (!title && !text && !media.length) { msg("Rien à enregistrer."); return; }
-  const e = { id: crypto.randomUUID(), ts: Date.now(), title, text,
-    media: media.map(m => ({ name: m.name, type: m.type, blob: m.blob })), synced: false };
-  await dbPut(e);
+  saving = true; $("saveBtn").disabled = true; msg("Enregistrement…");
+  try {
+    // Conversion en ArrayBuffer : fiable sur iPhone, contrairement aux Blob/File.
+    const stored = [];
+    for (const m of media) stored.push({ name: m.name, type: m.type, data: await toBuf(m.blob) });
+    const e = { id: crypto.randomUUID(), ts: Date.now(), title, text, media: stored, synced: false };
+    await dbPut(e);
+  } catch (err) {
+    // Rien n'est effacé : la saisie et les pièces jointes restent à l'écran.
+    msg("Échec de l'enregistrement : " + (err && err.message || err));
+    saving = false; $("saveBtn").disabled = false;
+    return;
+  }
   media.forEach(m => URL.revokeObjectURL(m.url)); media = [];
   $("title").value = ""; $("text").value = ""; localStorage.removeItem("draft");
-  renderChips(); await renderList(); msg("Enregistré sur l'iPhone ✓");
+  renderChips();
+  try { await renderList(); } catch {}
+  msg("Enregistré sur l'iPhone ✓");
+  saving = false; $("saveBtn").disabled = false;
   syncAll();
 };
 $("text").oninput = $("title").oninput = () =>
@@ -305,7 +346,7 @@ async function renderList() {
 
 /* ---------- Démarrage ---------- */
 (async () => {
-  await openDB();
+  try { await openDB(); } catch (err) { msg("Stockage local indisponible : " + err.message); return; }
   const d = JSON.parse(localStorage.getItem("draft") || "null");
   if (d) { $("title").value = d.t; $("text").value = d.x; }
   if (CFG.CLIENT_ID.startsWith("COLLE_")) msg("⚠️ Configure d'abord ton ID client Google dans index.html (voir LISEZMOI.md).");
