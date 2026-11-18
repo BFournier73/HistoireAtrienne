@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Journal">
+<meta name="theme-color" content="#1f6feb">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Mon Journal</title>
+<style>
+  :root { --bg:#f2f2f7; --card:#fff; --txt:#111; --mut:#6b7280; --acc:#1f6feb; --ok:#1a9b4b; --warn:#d97706; --err:#d93025; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#000; --card:#1c1c1e; --txt:#f2f2f7; --mut:#9ca3af; }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; font:17px/1.4 -apple-system, system-ui, sans-serif; background:var(--bg); color:var(--txt);
+         padding: env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 24px); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 16px 6px; }
+  h1 { font-size:26px; margin:0; }
+  .date { color:var(--mut); font-size:14px; }
+  .pill { font-size:13px; padding:5px 10px; border-radius:999px; background:var(--card); border:1px solid #8883; }
+  .pill.on { color:var(--ok); } .pill.off { color:var(--warn); }
+  .card { background:var(--card); margin:10px 12px; padding:12px; border-radius:14px; }
+  input[type=text], textarea { width:100%; border:0; outline:0; background:transparent; color:var(--txt); font:inherit; }
+  input[type=text] { font-weight:600; padding:4px 0 8px; border-bottom:1px solid #8883; margin-bottom:8px; }
+  textarea { min-height:150px; resize:vertical; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  button, label.btn { font:inherit; font-size:16px; border:0; border-radius:12px; padding:11px 14px; background:#8881; color:var(--txt);
+                      cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
+  button.primary { background:var(--acc); color:#fff; font-weight:600; width:100%; justify-content:center; margin-top:12px; padding:14px; }
+  button.rec { background:var(--err); color:#fff; }
+  button:disabled { opacity:.5; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .chip { position:relative; background:#8881; border-radius:10px; padding:4px; font-size:13px; max-width:100%; }
+  .chip img { width:72px; height:72px; object-fit:cover; border-radius:8px; display:block; }
+  .chip span.l { display:block; padding:6px 8px; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chip button { position:absolute; top:-8px; right:-8px; width:24px; height:24px; padding:0; border-radius:50%; background:#000a; color:#fff; justify-content:center; font-size:14px; }
+  .chip audio { height:34px; max-width:220px; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); margin:20px 16px 4px; }
+  .entry { border-top:1px solid #8882; padding:10px 0; } .entry:first-child { border-top:0; }
+  .entry .t { font-weight:600; } .entry .m { font-size:13px; color:var(--mut); }
+  .entry .s { font-size:13px; } .s.ok { color:var(--ok); } .s.wait { color:var(--warn); } .s.err { color:var(--err); }
+  .entry .p { font-size:15px; color:var(--mut); white-space:pre-wrap; max-height:3.1em; overflow:hidden; }
+  #msg { margin:8px 16px; font-size:14px; color:var(--mut); min-height:1.2em; }
+  .timer { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Mon Journal</h1><div class="date" id="today"></div></div>
+  <button class="pill off" id="authBtn">Google : déconnecté</button>
+</header>
+
+<div class="card">
+  <input type="text" id="title" placeholder="Titre (facultatif)">
+  <textarea id="text" placeholder="Raconte ta journée…"></textarea>
+  <div class="chips" id="chips"></div>
+  <div class="row">
+    <label class="btn">📷 Photo<input type="file" id="photoIn" accept="image/*" multiple hidden></label>
+    <button id="recBtn">🎙️ Mémo vocal</button>
+    <label class="btn">📎 Fichier<input type="file" id="fileIn" multiple hidden></label>
+  </div>
+  <button class="primary" id="saveBtn">Enregistrer l'entrée</button>
+</div>
+<div id="msg"></div>
+
+<h2>Entrées récentes</h2>
+<div class="card" id="list"><div class="m">Aucune entrée pour l'instant.</div></div>
+<div class="row" style="margin:0 12px"><button id="syncBtn">🔄 Synchroniser maintenant</button></div>
+
+<script>
+// ====== CONFIGURATION — colle ici ton ID client OAuth Google (voir LISEZMOI.md) ======
+window.JOURNAL_CONFIG = {
+  CLIENT_ID: "COLLE_TON_ID_CLIENT.apps.googleusercontent.com",
+  ROOT_FOLDER: "Journal",   // dossier racine créé dans ton Google Drive
+  MAX_PHOTO_PX: 2560        // réduit les grosses photos (0 = garder l'original)
+};
+</script>
+<script>
+const CFG = window.JOURNAL_CONFIG;
+const SCOPE = "https://www.googleapis.com/auth/drive.file";
+const $ = id => document.getElementById(id);
+const pad = n => String(n).padStart(2, "0");
+const dayStr = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const timeStr = d => `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+const safe = s => s.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w.\- ]+/g, "_").trim().slice(0, 60) || "fichier";
+function msg(t) { $("msg").textContent = t || ""; }
+
+$("today").textContent = new Date().toLocaleDateString("fr-CA", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+
+/* ---------- IndexedDB ---------- */
+let db;
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("journal", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("entries", { keyPath: "id" });
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+}
+const tx = (mode) => db.transaction("entries", mode).objectStore("entries");
+const dbAll = () => new Promise(res => { const q = tx("readonly").getAll(); q.onsuccess = () => res(q.result); });
+const dbPut = e => new Promise(res => { const q = tx("readwrite").put(e); q.onsuccess = res; });
+const dbDel = id => new Promise(res => { const q = tx("readwrite").delete(id); q.onsuccess = res; });
+
+/* ---------- Auth Google (flux implicite par redirection) ---------- */
+function redirectUri() { return location.origin + location.pathname; }
+function getToken() {
+  const t = JSON.parse(localStorage.getItem("g_token") || "null");
+  return t && t.exp > Date.now() + 30000 ? t.value : null;
+}
+function login() {
+  const state = crypto.randomUUID();
+  localStorage.setItem("g_state", state);
+  const p = new URLSearchParams({
+    client_id: CFG.CLIENT_ID, redirect_uri: redirectUri(), response_type: "token",
+    scope: SCOPE, state, include_granted_scopes: "true"
+  });
+  location.href = "https://accounts.google.com/o/oauth2/v2/auth?" + p;
+}
+function handleRedirect() {
+  if (!location.hash.includes("access_token")) return false;
+  const p = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, "", location.pathname);
+  if (p.get("state") !== localStorage.getItem("g_state")) { msg("Connexion refusée (state invalide)."); return false; }
+  localStorage.setItem("g_token", JSON.stringify({ value: p.get("access_token"), exp: Date.now() + (+p.get("expires_in") || 3600) * 1000 }));
+  return true;
+}
+function refreshAuthUI() {
+  const on = !!getToken();
+  $("authBtn").className = "pill " + (on ? "on" : "off");
+  $("authBtn").textContent = on ? "Google : connecté ✓" : "Google : se connecter";
+}
+$("authBtn").onclick = () => { if (getToken()) { if (confirm("Se déconnecter de Google ?")) { localStorage.removeItem("g_token"); refreshAuthUI(); } } else login(); };
+
+/* ---------- Drive ---------- */
+async function gfetch(url, opts = {}) {
+  const t = getToken();
+  if (!t) throw new Error("AUTH");
+  const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + t } });
+  if (r.status === 401) { localStorage.removeItem("g_token"); refreshAuthUI(); throw new Error("AUTH"); }
+  if (!r.ok) throw new Error("Drive " + r.status + " " + (await r.text()).slice(0, 200));
+  return r.json();
+}
+async function ensureFolder(name, parentId) {
+  const cacheKey = "folder:" + (parentId || "root") + ":" + name;
+  const cached = localStorage.getItem(cacheKey);
+  if (cached) return cached;
+  let q = `mimeType='application/vnd.google-apps.folder' and trashed=false and name='${name.replace(/'/g, "\\'")}'`;
+  if (parentId) q += ` and '${parentId}' in parents`;
+  const found = await gfetch("https://www.googleapis.com/drive/v3/files?fields=files(id)&q=" + encodeURIComponent(q));
+  let id = found.files[0] && found.files[0].id;
+  if (!id) {
+    const meta = { name, mimeType: "application/vnd.google-apps.folder", ...(parentId ? { parents: [parentId] } : {}) };
+    id = (await gfetch("https://www.googleapis.com/drive/v3/files?fields=id", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(meta) })).id;
+  }
+  localStorage.setItem(cacheKey, id);
+  return id;
+}
+async function uploadFile(name, mime, blob, parentId) {
+  const b = "jrnl" + Math.random().toString(36).slice(2);
+  const body = new Blob([
+    `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [parentId] })}\r\n`,
+    `--${b}\r\nContent-Type: ${mime || "application/octet-stream"}\r\n\r\n`, blob, `\r\n--${b}--`
+  ]);
+  return gfetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+    method: "POST", headers: { "Content-Type": "multipart/related; boundary=" + b }, body });
+}
+
+let syncing = false;
+async function syncAll() {
+  if (syncing) return;
+  if (!getToken()) { msg("Non connecté à Google — les entrées restent sur l'iPhone."); return; }
+  syncing = true; $("syncBtn").disabled = true;
+  try {
+    const entries = (await dbAll()).filter(e => !e.synced).sort((a, b) => a.ts - b.ts);
+    for (const e of entries) {
+      msg(`Envoi de « ${e.title || "entrée"} »…`);
+      const d = new Date(e.ts);
+      const root = await ensureFolder(CFG.ROOT_FOLDER, null);
+      const day = await ensureFolder(dayStr(d), root);
+      const prefix = timeStr(d);
+      for (const m of e.media) {
+        if (m.uploaded) continue;
+        await uploadFile(`${prefix}_${m.name}`, m.type, m.blob, day);
+        m.uploaded = true; await dbPut(e);   // reprise possible si coupure
+      }
+      if (!e.textUploaded) {
+        const lines = [`# ${e.title || "Entrée du " + dayStr(d)}`, `*${dayStr(d)} ${d.toLocaleTimeString("fr-CA")}*`, "", e.text || ""];
+        if (e.media.length) lines.push("", "## Pièces jointes", ...e.media.map(m => `- ${prefix}_${m.name}`));
+        await uploadFile(`${prefix}_${safe(e.title || "entree")}.md`, "text/markdown", new Blob([lines.join("\n")], { type: "text/markdown" }), day);
+        e.textUploaded = true;
+      }
+      e.synced = true; await dbPut(e);
+    }
+    msg(entries.length ? "Synchronisation terminée ✓" : "Tout est déjà synchronisé.");
+  } catch (err) {
+    msg(err.message === "AUTH" ? "Session Google expirée — touche « se connecter »." : "Erreur : " + err.message);
+  } finally { syncing = false; $("syncBtn").disabled = false; renderList(); }
+}
+$("syncBtn").onclick = syncAll;
+
+/* ---------- Brouillon en cours ---------- */
+let media = [];   // {name,type,blob,url}
+function renderChips() {
+  $("chips").innerHTML = "";
+  media.forEach((m, i) => {
+    const c = document.createElement("div"); c.className = "chip";
+    if (m.type.startsWith("image/")) c.innerHTML = `<img src="${m.url}">`;
+    else if (m.type.startsWith("audio/")) c.innerHTML = `<audio controls src="${m.url}"></audio>`;
+    else c.innerHTML = `<span class="l">📎 ${m.name}</span>`;
+    const x = document.createElement("button"); x.textContent = "✕";
+    x.onclick = () => { URL.revokeObjectURL(m.url); media.splice(i, 1); renderChips(); };
+    c.appendChild(x); $("chips").appendChild(c);
+  });
+}
+async function shrink(file) {
+  if (!CFG.MAX_PHOTO_PX || !file.type.startsWith("image/")) return file;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const k = Math.min(1, CFG.MAX_PHOTO_PX / Math.max(bmp.width, bmp.height));
+    if (k === 1 && file.type === "image/jpeg") return file;
+    const c = document.createElement("canvas"); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    return await new Promise(r => c.toBlob(r, "image/jpeg", 0.9));
+  } catch { return file; }
+}
+async function addFiles(files, isPhoto) {
+  for (const f of files) {
+    const blob = isPhoto ? await shrink(f) : f;
+    let name = safe(f.name || "fichier");
+    if (isPhoto && blob !== f) name = name.replace(/\.\w+$/, "") + ".jpg";
+    media.push({ name, type: blob.type || f.type || "application/octet-stream", blob, url: URL.createObjectURL(blob) });
+  }
+  renderChips();
+}
+$("photoIn").onchange = async e => { await addFiles([...e.target.files], true); e.target.value = ""; };
+$("fileIn").onchange = async e => { await addFiles([...e.target.files], false); e.target.value = ""; };
+
+/* ---------- Mémo vocal ---------- */
+let rec = null, stream = null, chunks = [], t0 = 0, tick = null;
+$("recBtn").onclick = async () => {
+  if (rec) { rec.stop(); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+    rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+    chunks = [];
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = () => {
+      clearInterval(tick); stream.getTracks().forEach(t => t.stop());
+      const type = rec.mimeType || "audio/mp4";
+      const blob = new Blob(chunks, { type });
+      const ext = type.includes("mp4") ? "m4a" : "webm";
+      media.push({ name: `memo_${timeStr(new Date())}.${ext}`, type, blob, url: URL.createObjectURL(blob) });
+      rec = null; $("recBtn").className = ""; $("recBtn").textContent = "🎙️ Mémo vocal"; renderChips();
+    };
+    rec.start(); t0 = Date.now();
+    $("recBtn").className = "rec";
+    tick = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      $("recBtn").innerHTML = `⏹ Arrêter <span class="timer">${pad(Math.floor(s/60))}:${pad(s%60)}</span>`;
+    }, 250);
+  } catch (err) { msg("Micro inaccessible : " + err.message); rec = null; }
+};
+
+/* ---------- Enregistrer ---------- */
+$("saveBtn").onclick = async () => {
+  const title = $("title").value.trim(), text = $("text").value.trim();
+  if (!title && !text && !media.length) { msg("Rien à enregistrer."); return; }
+  const e = { id: crypto.randomUUID(), ts: Date.now(), title, text,
+    media: media.map(m => ({ name: m.name, type: m.type, blob: m.blob })), synced: false };
+  await dbPut(e);
+  media.forEach(m => URL.revokeObjectURL(m.url)); media = [];
+  $("title").value = ""; $("text").value = ""; localStorage.removeItem("draft");
+  renderChips(); await renderList(); msg("Enregistré sur l'iPhone ✓");
+  syncAll();
+};
+$("text").oninput = $("title").oninput = () =>
+  localStorage.setItem("draft", JSON.stringify({ t: $("title").value, x: $("text").value }));
+
+/* ---------- Liste ---------- */
+async function renderList() {
+  const all = (await dbAll()).sort((a, b) => b.ts - a.ts).slice(0, 30);
+  if (!all.length) { $("list").innerHTML = '<div class="m">Aucune entrée pour l\'instant.</div>'; return; }
+  $("list").innerHTML = "";
+  for (const e of all) {
+    const d = new Date(e.ts), div = document.createElement("div"); div.className = "entry";
+    const st = e.synced ? '<span class="s ok">☁️ Dans Google Drive</span>' : '<span class="s wait">⏳ En attente d\'envoi</span>';
+    div.innerHTML = `<div class="t"></div><div class="m">${d.toLocaleString("fr-CA", { dateStyle: "medium", timeStyle: "short" })} · ${e.media.length} pièce(s) · ${st}</div><div class="p"></div>`;
+    div.querySelector(".t").textContent = e.title || "(sans titre)";
+    div.querySelector(".p").textContent = e.text;
+    if (e.synced) { // permet de libérer l'espace sur l'iPhone
+      const b = document.createElement("button"); b.textContent = "Retirer de l'iPhone"; b.style.cssText = "font-size:13px;padding:5px 9px;margin-top:6px";
+      b.onclick = async () => { if (confirm("Retirer cette entrée de l'iPhone ? Elle reste dans Google Drive.")) { await dbDel(e.id); renderList(); } };
+      div.appendChild(b);
+    }
+    $("list").appendChild(div);
+  }
+}
+
+/* ---------- Démarrage ---------- */
+(async () => {
+  await openDB();
+  const d = JSON.parse(localStorage.getItem("draft") || "null");
+  if (d) { $("title").value = d.t; $("text").value = d.x; }
+  if (CFG.CLIENT_ID.startsWith("COLLE_")) msg("⚠️ Configure d'abord ton ID client Google dans index.html (voir LISEZMOI.md).");
+  const justLoggedIn = handleRedirect();
+  refreshAuthUI(); await renderList();
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+  if (getToken()) syncAll();
+  window.addEventListener("online", syncAll);
+})();
+</script>
+</body>
+</html>
