@@ -46,6 +46,17 @@
   .entry .p { font-size:15px; color:var(--mut); white-space:pre-wrap; max-height:3.1em; overflow:hidden; }
   #msg { margin:8px 16px; font-size:14px; color:var(--mut); min-height:1.2em; }
   .timer { font-variant-numeric: tabular-nums; }
+  #viewer { position:fixed; inset:0; background:var(--bg); overflow:auto; z-index:10; padding:env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 40px); }
+  #viewer[hidden] { display:none; }
+  #viewer .bar { display:flex; align-items:center; gap:10px; padding:12px 12px 4px; }
+  #viewer .bar h1 { font-size:22px; flex:1; }
+  #viewer input[type=search] { width:calc(100% - 24px); margin:6px 12px; padding:10px 12px; border:0; border-radius:12px; background:var(--card); color:var(--txt); font:inherit; }
+  #viewer .item { padding:10px 0; border-top:1px solid #8882; cursor:pointer; } #viewer .item:first-child { border-top:0; }
+  #viewer .full { white-space:pre-wrap; margin:10px 0; }
+  #viewer img, #viewer video { max-width:100%; border-radius:10px; display:block; margin:8px 0; }
+  #viewer audio { width:100%; margin:8px 0; }
+  #viewer a { color:var(--acc); }
+  #viewer table { width:100%; border-collapse:collapse; font-size:13px; } #viewer td { border-top:1px solid #8882; padding:6px 4px; vertical-align:top; word-break:break-word; }
 </style>
 </head>
 <body>
@@ -70,7 +81,8 @@
 
 <h2>Entrées récentes</h2>
 <div class="card" id="list"><div class="m">Aucune entrée pour l'instant.</div></div>
-<div class="row" style="margin:0 12px"><button id="syncBtn">🔄 Synchroniser maintenant</button></div>
+<div class="row" style="margin:0 12px"><button id="histBtn">📖 Historique</button><button id="syncBtn">🔄 Synchroniser maintenant</button></div>
+<div id="viewer" hidden></div>
 
 <script>
 // ====== CONFIGURATION ======
@@ -432,6 +444,8 @@ async function renderList() {
     div.innerHTML = `<div class="t"></div><div class="m">${d.toLocaleString("fr-CA", { dateStyle: "medium", timeStyle: "short" })} · ${e.media.length} pièce(s) · ${st}</div><div class="p"></div>`;
     div.querySelector(".t").textContent = e.title || "(sans titre)";
     div.querySelector(".p").textContent = e.text;
+    div.style.cursor = "pointer";
+    div.onclick = ev => { if (ev.target.tagName !== "BUTTON") openViewer(e.id); };
     if (e.synced) { // permet de libérer l'espace sur l'iPhone
       const b = document.createElement("button"); b.textContent = "Retirer de l'iPhone"; b.style.cssText = "font-size:13px;padding:5px 9px;margin-top:6px";
       b.onclick = async () => { if (confirm("Retirer cette entrée de l'iPhone ? Elle reste dans Google Drive.")) { await dbDel(e.id); renderList(); } };
@@ -440,6 +454,99 @@ async function renderList() {
     $("list").appendChild(div);
   }
 }
+
+/* ---------- Historique / visionneuse ---------- */
+let viewUrls = [];
+function freeUrls() { viewUrls.forEach(u => URL.revokeObjectURL(u)); viewUrls = []; }
+function closeViewer() { freeUrls(); $("viewer").hidden = true; document.body.style.overflow = ""; }
+function el(tag, cls, txt) { const x = document.createElement(tag); if (cls) x.className = cls; if (txt != null) x.textContent = txt; return x; }
+function viewerBar(title, backFn) {
+  const v = $("viewer"); freeUrls(); v.innerHTML = ""; v.scrollTop = 0;
+  const bar = el("div", "bar"); const b = el("button", "", "← Retour"); b.onclick = backFn;
+  bar.append(b, el("h1", "", title)); v.appendChild(bar); return v;
+}
+async function openViewer(id) {
+  const all = (await dbAll()).sort((a, b) => b.ts - a.ts);
+  $("viewer").hidden = false; document.body.style.overflow = "hidden";
+  const e = id && all.find(x => x.id === id);
+  if (e) showEntry(e); else showList(all);
+}
+function showList(all, q = "") {
+  const v = viewerBar("Historique", closeViewer);
+  const s = el("input"); s.type = "search"; s.placeholder = "Rechercher (titre, texte, date)…"; s.value = q;
+  v.appendChild(s);
+  const box = el("div", "card"); v.appendChild(box);
+  const draw = () => {
+    box.innerHTML = ""; const k = s.value.trim().toLowerCase();
+    const list = all.filter(e => !k || (e.title + " " + e.text + " " + dayStr(new Date(e.ts))).toLowerCase().includes(k));
+    if (!list.length) { box.appendChild(el("div", "m", all.length ? "Aucun résultat." : "Aucune entrée sur cet iPhone.")); return; }
+    let last = "";
+    for (const e of list) {
+      const d = new Date(e.ts), day = dayStr(d);
+      if (day !== last) { last = day; const h = el("div", "t", d.toLocaleDateString("fr-CA", { weekday: "long", day: "numeric", month: "long", year: "numeric" })); h.style.marginTop = "10px"; box.appendChild(h); }
+      const it = el("div", "item");
+      it.append(el("div", "t", e.title || "(sans titre)"),
+        el("div", "m", `${d.toLocaleTimeString("fr-CA", { hour: "2-digit", minute: "2-digit" })} · ${e.media.length} pièce(s) · ${e.synced ? "☁️ dans Drive" : "⏳ en attente"}`),
+        el("div", "p", e.text));
+      it.onclick = () => showEntry(e, () => showList(all, s.value));
+      box.appendChild(it);
+    }
+  };
+  s.oninput = draw; draw();
+  const drv = el("button", "", "☁️ Voir l'historique Google Drive"); drv.style.margin = "4px 12px";
+  drv.onclick = () => showDrive(() => showList(all, s.value));
+  v.appendChild(drv);
+}
+function showEntry(e, back) {
+  const v = viewerBar("Entrée", back || (() => openViewer()));
+  const d = new Date(e.ts), c = el("div", "card"); v.appendChild(c);
+  c.append(el("div", "t", e.title || "(sans titre)"),
+    el("div", "m", d.toLocaleString("fr-CA", { dateStyle: "full", timeStyle: "short" }) + (e.synced ? " · ☁️ dans Drive" : " · ⏳ en attente d'envoi")),
+    el("div", "full", e.text || "(aucun texte)"));
+  for (const m of e.media) {
+    const blob = mediaBlob(m);
+    if (blob) {
+      const u = URL.createObjectURL(blob); viewUrls.push(u);
+      if (m.type.startsWith("image/")) { const i = el("img"); i.src = u; c.appendChild(i); }
+      else if (m.type.startsWith("video/")) { const x = el("video"); x.src = u; x.controls = true; x.playsInline = true; x.preload = "metadata"; c.appendChild(x); }
+      else if (m.type.startsWith("audio/")) { const x = el("audio"); x.src = u; x.controls = true; c.appendChild(x); }
+    }
+    const line = el("div", "m", "📎 " + m.name + " "); 
+    if (m.link) { const a = el("a", "", "Ouvrir dans Drive"); a.href = m.link; a.target = "_blank"; a.rel = "noopener"; line.appendChild(a); }
+    c.appendChild(line);
+  }
+  if (!e.media.length && !e.text) c.appendChild(el("div", "m", "Entrée vide."));
+}
+async function showDrive(back) {
+  const v = viewerBar("Historique Drive", back);
+  const c = el("div", "card"); v.appendChild(c); c.appendChild(el("div", "m", "Chargement…"));
+  try {
+    if (!getToken()) throw new Error("AUTH");
+    const root = await ensureFolder(CFG.ROOT_FOLDER, null);
+    let id = localStorage.getItem("indexId:" + root);
+    if (!id) {
+      const q = `name='${CFG.INDEX_NAME}' and '${root}' in parents and trashed=false and mimeType='${SHEET_MIME}'`;
+      const f = await gfetch("https://www.googleapis.com/drive/v3/files?fields=files(id)&q=" + encodeURIComponent(q));
+      id = f.files[0] && f.files[0].id;
+    }
+    if (!id) { c.innerHTML = ""; c.appendChild(el("div", "m", "Aucun index dans Drive pour l'instant.")); return; }
+    localStorage.setItem("indexId:" + root, id);
+    const rows = csvParse(await gtext(`https://www.googleapis.com/drive/v3/files/${id}/export?mimeType=text/csv`)).slice(1).reverse();
+    c.innerHTML = "";
+    if (!rows.length) { c.appendChild(el("div", "m", "L'index est vide.")); return; }
+    const t = el("table");
+    for (const r of rows) {
+      const tr = el("tr"), td = el("td");
+      td.append(el("div", "t", `${r[0]} ${r[1]} — ${r[2]}`), el("div", "m", `${r[3]} · ${r[4]}`));
+      if (r[6]) { const a = el("a", "", "Ouvrir"); a.href = r[6]; a.target = "_blank"; a.rel = "noopener"; td.appendChild(a); }
+      tr.appendChild(td); t.appendChild(tr);
+    }
+    c.appendChild(t);
+  } catch (err) {
+    c.innerHTML = ""; c.appendChild(el("div", "m", err.message === "AUTH" ? "Connecte-toi à Google pour voir l'historique Drive." : "Erreur : " + err.message));
+  }
+}
+$("histBtn").onclick = () => openViewer();
 
 /* ---------- Démarrage ---------- */
 (async () => {
